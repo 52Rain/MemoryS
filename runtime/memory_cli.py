@@ -4,6 +4,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
+import shlex
+import subprocess
+import tempfile
 from pathlib import Path
 import re
 import shutil
@@ -14,11 +18,11 @@ if str(_RUNTIME) not in sys.path:
     sys.path.insert(0, str(_RUNTIME))
 
 try:
-    from runtime.config import app_data_dir, config_file, load_user_config, resolve_vault, save_user_config
+    from runtime.config import app_data_dir, config_file, is_memorys_hook, load_user_config, resolve_vault, save_user_config
     from runtime.memory_reader import VaultReader
     from runtime import memory_store as store
 except ImportError:
-    from config import app_data_dir, config_file, load_user_config, resolve_vault, save_user_config
+    from config import app_data_dir, config_file, is_memorys_hook, load_user_config, resolve_vault, save_user_config
     from memory_reader import VaultReader
     import memory_store as store
 
@@ -30,6 +34,11 @@ def _runtime_paths() -> tuple[str, str, str]:
     return py, mcp_script, hook_script
 
 
+def _hook_command(py: str, script: str, vault: Path) -> str:
+    args = [py, "-B", script, "--vault", str(vault)]
+    return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+
+
 def _claude_snippets(vault: Path) -> tuple[dict, dict]:
     py, mcp_script, hook_script = _runtime_paths()
     mcp_entry = {
@@ -37,7 +46,7 @@ def _claude_snippets(vault: Path) -> tuple[dict, dict]:
         "args": ["-B", mcp_script],
         "env": {"MEMORYS_VAULT": str(vault)},
     }
-    hook_cmd = f'MEMORYS_VAULT="{vault}" "{py}" -B "{hook_script}"'
+    hook_cmd = _hook_command(py, hook_script, vault)
     hook_entry = {
         "hooks": [
             {
@@ -54,11 +63,11 @@ def _codex_snippets(vault: Path) -> tuple[str, dict]:
     py, mcp_script, hook_script = _runtime_paths()
     toml_block = (
         "\n[mcp_servers.memorys]\n"
-        f'command = "{py}"\n'
-        f'args = ["-B", "{mcp_script}"]\n'
-        f'env = {{ MEMORYS_VAULT = "{vault}" }}\n'
+        f'command = {json.dumps(py, ensure_ascii=False)}\n'
+        f'args = ["-B", {json.dumps(mcp_script, ensure_ascii=False)}]\n'
+        f'env = {{ MEMORYS_VAULT = {json.dumps(str(vault), ensure_ascii=False)} }}\n'
     )
-    hook_cmd = f'MEMORYS_VAULT="{vault}" "{py}" -B "{hook_script}"'
+    hook_cmd = _hook_command(py, hook_script, vault)
     hook_entry = {
         "hooks": [
             {
@@ -90,15 +99,36 @@ def _backup_if_exists(path: Path) -> None:
         shutil.copy2(path, backup)
 
 
-def _merge_hook_json(path: Path, hook_entry: dict) -> None:
+def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {}
-    if path.is_file():
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
+        temp_path = Path(tmp.name)
+    try:
+        temp_path.write_text(text, encoding="utf-8")
         _backup_if_exists(path)
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = {}
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _json_object(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a JSON object in {path}.")
+    return data
+
+
+def _json_text(data: dict) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
+def _merged_hooks(path: Path, hook_entry: dict) -> str:
+    data = _json_object(path)
     hooks = data.setdefault("hooks", {})
     entries = hooks.setdefault("UserPromptSubmit", [])
     # Remove any existing memorys recall_hook entry to stay idempotent
@@ -107,15 +137,21 @@ def _merge_hook_json(path: Path, hook_entry: dict) -> None:
         sub = [
             h
             for h in group.get("hooks", [])
-            if "recall_hook.py" not in str(h.get("command", ""))
+            if not is_memorys_hook(str(h.get("command", "")))
         ]
-        if sub:
+        if len(sub) == len(group.get("hooks", [])):
+            filtered.append(group)
+        elif sub:
             new_group = dict(group)
             new_group["hooks"] = sub
             filtered.append(new_group)
     filtered.append(hook_entry)
     hooks["UserPromptSubmit"] = filtered
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return _json_text(data)
+
+
+def _merge_hook_json(path: Path, hook_entry: dict) -> None:
+    _atomic_write(path, _merged_hooks(path, hook_entry))
 
 
 def _connect_client(client: str, vault: Path, apply: bool, home: Path | None = None) -> int:
@@ -130,13 +166,12 @@ def _connect_client(client: str, vault: Path, apply: bool, home: Path | None = N
             print("\nRun with --apply to write these files automatically (with .bak backups).")
             return 0
         claude_json = h / ".claude.json"
-        data = {}
-        if claude_json.is_file():
-            _backup_if_exists(claude_json)
-            data = json.loads(claude_json.read_text(encoding="utf-8"))
+        data = _json_object(claude_json)
         data.setdefault("mcpServers", {})["memorys"] = mcp_entry
-        claude_json.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        _merge_hook_json(h / ".claude" / "settings.json", hook_entry)
+        hook_path = h / ".claude" / "settings.json"
+        hook_text = _merged_hooks(hook_path, hook_entry)
+        _atomic_write(claude_json, _json_text(data))
+        _atomic_write(hook_path, hook_text)
         print(f"Connected Claude Code -> {vault}")
         print(f"  MCP:  {claude_json}")
         print(f"  Hook: {h / '.claude' / 'settings.json'}")
@@ -151,27 +186,31 @@ def _connect_client(client: str, vault: Path, apply: bool, home: Path | None = N
             print(json.dumps({"hooks": {"UserPromptSubmit": [hook_entry]}}, ensure_ascii=False, indent=2))
             print("\nRun with --apply to write these files automatically (with .bak backups).")
             return 0
-        codex_toml = h / ".codex" / "config.toml"
+        codex_dir = h / ".codex"
+        if home is None and os.environ.get("CODEX_HOME"):
+            codex_dir = Path(os.environ["CODEX_HOME"]).expanduser()
+        codex_toml = codex_dir / "config.toml"
         codex_toml.parent.mkdir(parents=True, exist_ok=True)
         existing = ""
         if codex_toml.is_file():
-            _backup_if_exists(codex_toml)
             existing = codex_toml.read_text(encoding="utf-8")
         if re.search(r"^\[mcp_servers\.memorys\]", existing, re.M):
             updated = re.sub(
                 r"^\[mcp_servers\.memorys\][\s\S]*?(?=^\[|\Z)",
-                toml_block.lstrip() + "\n",
+                lambda _m: toml_block.lstrip() + "\n",
                 existing,
                 flags=re.M,
             )
         else:
             suffix = "" if (not existing or existing.endswith("\n")) else "\n"
             updated = existing + suffix + toml_block
-        codex_toml.write_text(updated, encoding="utf-8")
-        _merge_hook_json(h / ".codex" / "hooks.json", hook_entry)
+        hook_path = codex_dir / "hooks.json"
+        hook_text = _merged_hooks(hook_path, hook_entry)
+        _atomic_write(codex_toml, updated)
+        _atomic_write(hook_path, hook_text)
         print(f"Connected Codex -> {vault}")
         print(f"  MCP:  {codex_toml}")
-        print(f"  Hook: {h / '.codex' / 'hooks.json'}")
+        print(f"  Hook: {hook_path}")
         return 0
 
     if client == "cursor":
@@ -183,12 +222,9 @@ def _connect_client(client: str, vault: Path, apply: bool, home: Path | None = N
             return 0
         cursor_json = h / ".cursor" / "mcp.json"
         cursor_json.parent.mkdir(parents=True, exist_ok=True)
-        data = {}
-        if cursor_json.is_file():
-            _backup_if_exists(cursor_json)
-            data = json.loads(cursor_json.read_text(encoding="utf-8"))
+        data = _json_object(cursor_json)
         data.setdefault("mcpServers", {})["memorys"] = snippet["mcpServers"]["memorys"]
-        cursor_json.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _atomic_write(cursor_json, _json_text(data))
         print(f"Connected Cursor -> {vault}")
         print(f"  MCP: {cursor_json}")
         return 0
@@ -205,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="Initialize a new Git-backed MemoryS Vault")
-    p_init.add_argument("path", nargs="?", default="~/MemoryS", help="Target Vault directory (default: ~/MemoryS)")
+    p_init.add_argument("path", nargs="?", default="~/memorys-vault", help="Target Vault directory (default: ~/memorys-vault)")
     p_init.add_argument("--demo", action="store_true", help="Populate with sample cards demonstrating temporal supersession")
 
     p_connect = sub.add_parser("connect", help="Print or apply MCP & Hook config for an AI client")
@@ -213,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
     p_connect.add_argument("--apply", action="store_true", help="Write configuration to client config files (creates .bak backup)")
 
     p_ui = sub.add_parser("ui", help="Launch local web review & library console (cross-platform)")
+    p_ui.add_argument("--ui-dir", type=Path, help="Directory with built app.js and app.css")
     p_ui.add_argument("--port", type=int, default=8765, help="Localhost port (default: 8765)")
     p_ui.add_argument("--no-open", action="store_true", help="Do not open browser automatically")
 
@@ -262,17 +299,16 @@ def main(argv: list[str] | None = None) -> int:
         print("  2. Open review UI:      mem ui")
         return 0
 
-    vault = resolve_vault(args.vault or None)
+    vault = resolve_vault(args.vault or None, read_fallback=args.command in {"status", "search", "context", "read", "trace"})
 
     if args.command == "connect":
         return _connect_client(args.client, vault, apply=args.apply)
 
     if args.command == "ui":
-        try:
-            from runtime.web_server import serve_web_ui
-        except ImportError:
-            from web_server import serve_web_ui
-        return serve_web_ui(port=args.port, vault_path=vault, open_browser=not args.no_open)
+        if not __package__:
+            sys.path.insert(0, str(_RUNTIME.parent))
+        from runtime.web_server import serve_web_ui
+        return serve_web_ui(port=args.port, vault_path=vault, open_browser=not args.no_open, ui_dir=args.ui_dir)
 
     if args.command == "status":
         reader = VaultReader(vault) if vault.is_dir() else None

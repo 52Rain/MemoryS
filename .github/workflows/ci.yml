@@ -10,12 +10,16 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.12"]
         exclude:
+          - os: windows-latest
+            python-version: "3.10"
           - os: macos-latest
             python-version: "3.10"
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -23,6 +27,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Run MemoryS runtime & workflow tests
         run: python -B -m unittest discover -v -s tests
+
+      - name: Verify non-editable install outside checkout
+        run: python -B tests/check_install.py
 
   ui-build:
     timeout-minutes: 10
@@ -39,3 +46,9 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Check Markdown termination and escaping
+        run: timeout 10s node tests/check_markdown.mjs
+      - name: Check packaged UI matches fresh build
+        run: |
+          cmp desktop-app/dist/app.js runtime/ui/app.js
+          cmp desktop-app/dist/app.css runtime/ui/app.css

@@ -7,7 +7,8 @@ rm -rf "$bundle"
 mkdir -p "$bundle/Contents/"{MacOS,Resources/ui,Resources/service}
 swiftc -O native/App.swift -o "$bundle/Contents/MacOS/MemoryS" -framework AppKit -framework WebKit -framework Security
 cp dist/app.js dist/app.css public/index.html "$bundle/Contents/Resources/ui/"
-cp service/*.py ../runtime/config.py ../runtime/memory_reader.py ../runtime/memory_store.py "$bundle/Contents/Resources/service/"
+cp service/*.py ../runtime/config.py ../runtime/memory_reader.py ../runtime/memory_store.py ../runtime/service_library.py ../runtime/service_backend.py "$bundle/Contents/Resources/service/"
+cp -R ../runtime/demo_vault "$bundle/Contents/Resources/service/"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>dev.memorys.desktop</string>

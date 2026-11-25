@@ -139,7 +139,7 @@ def handle_tool_call(
     app_data_dir: Path | None = None,
 ) -> dict[str, Any]:
     args = arguments or {}
-    vault = resolve_vault(vault_path)
+    vault = resolve_vault(vault_path, read_fallback=name != "memory_propose")
     if name == "memory_search":
         reader = VaultReader(vault)
         items = reader.search(

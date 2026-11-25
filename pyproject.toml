@@ -33,3 +33,6 @@ memorys-hook = "runtime.recall_hook:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["runtime*"]
+
+[tool.setuptools.package-data]
+runtime = ["demo_vault/**/*", "demo_vault/*", "ui_index.html", "ui/*.js", "ui/*.css"]

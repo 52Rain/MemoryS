@@ -10,28 +10,33 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import sys
 import uuid
 
 try:
-    from runtime.config import app_data_dir, find_git, resolve_vault, workspace_lock
+    from runtime.config import _looks_like_vault, app_data_dir, find_git, resolve_vault, vault_child, workspace_lock
     from runtime.memory_reader import (
         SCOPE_LABELS,
+        ProjectInfo,
         VaultReader,
         _parse_date,
         dump_frontmatter,
         parse_frontmatter,
         subject_key,
+        validate_project_id,
     )
 except ImportError:
-    from config import app_data_dir, find_git, resolve_vault, workspace_lock
+    from config import _looks_like_vault, app_data_dir, find_git, resolve_vault, vault_child, workspace_lock
     from memory_reader import (
         SCOPE_LABELS,
+        ProjectInfo,
         VaultReader,
         _parse_date,
         dump_frontmatter,
         parse_frontmatter,
         subject_key,
+        validate_project_id,
     )
 
 
@@ -73,9 +78,14 @@ def normalize_state(raw: str) -> str:
     return val or "pending"
 
 
-def validate_proposal_text(title: str, body: str, quote: str = "") -> None:
+def validate_proposal_text(title: str, body: str, quote: str = "", *, scope: str = "",
+                           use_when: tuple | list = (), client: str = "") -> None:
     """Reject secrets/credentials and explicit 'do not record' directives."""
-    combined = "\n".join(part for part in (title, body, quote) if part)
+    if not title or len(title) > 120 or not body or len(body) > 8000:
+        raise ValueError("Title must be 1–120 characters and body 1–8000 characters.")
+    if len(client) > 80 or any(len(item) > 100 for item in use_when):
+        raise ValueError("Client must be at most 80 characters and each use_when item at most 100.")
+    combined = "\n".join(part for part in (title, body, quote, scope, client, *use_when) if part)
     for pattern in SECRET_PATTERNS:
         if pattern.search(combined):
             raise ValueError(
@@ -122,21 +132,25 @@ def connect_db(data_dir: Path | None = None) -> sqlite3.Connection:
             kind TEXT DEFAULT 'decision',
             effective_from TEXT DEFAULT '',
             use_when TEXT DEFAULT '[]',
-            created_at TEXT DEFAULT ''
+            created_at TEXT DEFAULT '',
+            vault_path TEXT DEFAULT ''
         );
         """
     )
-    existing = {row[1] for row in db.execute("PRAGMA table_info(proposals)").fetchall()}
     migrations = {
+        "vault_path": "TEXT DEFAULT ''",
         "scope": "TEXT DEFAULT ''",
         "kind": "TEXT DEFAULT 'decision'",
         "effective_from": "TEXT DEFAULT ''",
         "use_when": "TEXT DEFAULT '[]'",
         "created_at": "TEXT DEFAULT ''",
     }
-    for col, col_def in migrations.items():
-        if col not in existing:
-            db.execute(f"ALTER TABLE proposals ADD COLUMN {col} {col_def}")
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        existing = {row[1] for row in db.execute("PRAGMA table_info(proposals)")}
+        for col, col_def in migrations.items():
+            if col not in existing:
+                db.execute(f"ALTER TABLE proposals ADD COLUMN {col} {col_def}")
     return db
 
 
@@ -187,11 +201,19 @@ def commit_vault_files(vault: Path, touched_paths: list[Path], message: str) -> 
             rels.append(rel)
     if not rels:
         return _git(repo_root, "rev-parse", "--short", "HEAD")
-    _git(repo_root, "add", "--", *rels)
-    status = _git(repo_root, "status", "--porcelain", "--", *rels)
-    if not status.strip():
-        return _git(repo_root, "rev-parse", "--short", "HEAD")
-    _git(repo_root, "commit", "--only", "-m", message, "--", *rels, check_identity=True)
+    # Restore only our entries if staging succeeds but the commit is rejected.
+    git = [find_git(), "-C", str(repo_root), "--literal-pathspecs"]
+    before = subprocess.check_output([*git, "ls-files", "--stage", "-z", "--", *rels])
+    try:
+        _git(repo_root, "--literal-pathspecs", "add", "--", *rels)
+        status = _git(repo_root, "--literal-pathspecs", "status", "--porcelain", "--", *rels)
+        if not status:
+            return _git(repo_root, "rev-parse", "--short", "HEAD")
+        _git(repo_root, "--literal-pathspecs", "commit", "--only", "-m", message, "--", *rels, check_identity=True)
+    except BaseException:
+        subprocess.run([*git, "update-index", "--force-remove", "--", *rels], check=True)
+        subprocess.run([*git, "update-index", "-z", "--index-info"], input=before, check=True)
+        raise
     return _git(repo_root, "rev-parse", "HEAD")
 
 
@@ -212,23 +234,59 @@ def _vault_sources_file(vault: Path) -> Path:
 def init_vault(target: str | Path, *, with_demo: bool = False) -> Path:
     """Initialize a fresh Git-backed MemoryS Obsidian vault."""
     vault = Path(target).expanduser().resolve()
-    vault.mkdir(parents=True, exist_ok=True)
-    for sub in ("projects", "notes/preferences", "notes/methods", "notes/domain", "templates"):
-        (vault / sub).mkdir(parents=True, exist_ok=True)
+    source = Path(__file__).resolve().parents[1]
+
+    def is_checkout(path: Path) -> bool:
+        return (path / "pyproject.toml").is_file() and (path / "runtime/memory_store.py").is_file()
+
+    def in_isolated_temp(root: Path) -> bool:
+        temp = Path(tempfile.gettempdir()).resolve()
+        return temp != root and temp.is_relative_to(root) and temp in vault.parents
+
+    for parent in (vault, *vault.parents):
+        if is_checkout(parent) and not in_isolated_temp(parent):
+            raise ValueError("Choose a separate vault directory outside the MemoryS source, e.g. ~/memorys-vault.")
+    if is_checkout(source) and source.is_relative_to(vault):
+        raise ValueError("Choose a separate directory for the vault, e.g. ~/memorys-vault.")
+
+    existing_parent = next(path for path in (vault, *vault.parents) if path.exists())
+    try:
+        repo_root = _git_root(existing_parent)
+    except ValueError:
+        repo_root = None
+    if repo_root and in_isolated_temp(repo_root):
+        # Initialize an independent Git repository for this temporary vault.
+        repo_root = None
+    if repo_root and is_checkout(repo_root):
+        raise ValueError("Choose a separate directory for the vault, e.g. ~/memorys-vault.")
+    if repo_root and repo_root != vault and not _looks_like_vault(vault):
+        raise ValueError("Cannot initialize a new vault inside an unrelated Git repository.")
 
     if with_demo:
-        demo_src = Path(__file__).resolve().parents[1] / "examples" / "demo-vault"
-        if demo_src.is_dir():
-            for src_file in demo_src.rglob("*"):
-                if src_file.is_file():
-                    rel = src_file.relative_to(demo_src)
-                    dest = vault / rel
+        demo_src = Path(__file__).resolve().parent / "demo_vault"
+        if not demo_src.is_dir():
+            demo_src = source / "examples" / "demo-vault"
+        if not demo_src.is_dir():
+            raise FileNotFoundError("MemoryS demo vault template is missing.")
+
+    created_files: list[Path] = []
+    vault.mkdir(parents=True, exist_ok=True)
+    for sub in ("projects", "notes/preferences", "notes/methods", "notes/domain", "templates"):
+        vault_child(vault, vault / sub).mkdir(parents=True, exist_ok=True)
+
+    if with_demo:
+        for src_file in demo_src.rglob("*"):
+            if src_file.is_file():
+                dest = vault_child(vault, vault / src_file.relative_to(demo_src))
+                if not dest.exists():
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    if not dest.exists():
-                        shutil.copy2(src_file, dest)
+                    shutil.copy2(src_file, dest)
+                    created_files.append(dest)
 
     start_md = vault / "START.md"
+    start_md = vault_child(vault, start_md)
     if not start_md.exists():
+        created_files.append(start_md)
         start_md.write_text(
             "# MemoryS Vault\n\n"
             "Local-first, human-governed memory vault for AI agents.\n\n"
@@ -237,19 +295,25 @@ def init_vault(target: str | Path, *, with_demo: bool = False) -> Path:
             encoding="utf-8",
         )
     projects_md = _vault_index_file(vault)
+    projects_md = vault_child(vault, projects_md)
     if not projects_md.exists():
+        created_files.append(projects_md)
         projects_md.write_text(
             "# Projects\n\nAuto-updated index of projects in this vault.\n",
             encoding="utf-8",
         )
     sources_md = _vault_sources_file(vault)
+    sources_md = vault_child(vault, sources_md)
     if not sources_md.exists():
+        created_files.append(sources_md)
         sources_md.write_text(
             "# Sources\n\nTrace published memory cards back to original quotes and events.\n\n```jsonl\n```\n",
             encoding="utf-8",
         )
     tpl_md = vault / "templates" / "memory-card.md"
+    tpl_md = vault_child(vault, tpl_md)
     if not tpl_md.exists():
+        created_files.append(tpl_md)
         tpl_md.write_text(
             "---\n"
             "id: card-id\n"
@@ -266,23 +330,25 @@ def init_vault(target: str | Path, *, with_demo: bool = False) -> Path:
             encoding="utf-8",
         )
     gitignore = vault / ".gitignore"
+    gitignore = vault_child(vault, gitignore)
     if not gitignore.exists():
+        created_files.append(gitignore)
         gitignore.write_text(".obsidian/workspace*\n.DS_Store\n", encoding="utf-8")
 
-    # Initialize git if not already inside a git repository
-    git_bin = find_git()
-    check = subprocess.run(
-        [git_bin, "-C", str(vault), "rev-parse", "--is-inside-work-tree"],
-        capture_output=True,
-        text=True,
-    )
-    if check.returncode != 0:
-        subprocess.run([git_bin, "init", "-q", "-b", "main", str(vault)], check=True)
-    _git(vault, "add", "-A")
-    status = _git(vault, "status", "--porcelain")
-    if status.strip():
-        _git(vault, "commit", "-m", "Initialize MemoryS vault", check_identity=True)
+    if repo_root is None:
+        subprocess.run([find_git(), "init", "-q", "-b", "main", str(vault)], check=True)
+    if created_files:
+        commit_vault_files(vault, created_files, "Initialize MemoryS vault")
     return vault
+
+
+def open_or_init_vault(target: str | Path, *, with_demo: bool = False) -> Path:
+    vault = Path(target).expanduser().resolve()
+    if _looks_like_vault(vault):
+        return vault
+    if vault.exists() and (not vault.is_dir() or any(vault.iterdir())):
+        raise ValueError("Choose an existing MemoryS vault or an empty directory.")
+    return init_vault(vault, with_demo=with_demo)
 
 
 def normalize_scope(scope_input: str, reader: VaultReader) -> tuple[str, str, str]:
@@ -366,17 +432,11 @@ def create_proposal(
     clean_title = (title or "").strip()
     clean_body = (body or "").strip()
     clean_quote = (quote or "").strip()
-    if not clean_title or len(clean_title) > 120:
-        raise ValueError("Title (summary) must be between 1 and 120 characters.")
-    if not clean_body or len(clean_body) > 8000:
-        raise ValueError("Body must be between 1 and 8000 characters.")
-    validate_proposal_text(clean_title, clean_body, clean_quote)
-
     eff_date = (effective_from or "").strip() or date.today().isoformat()
     if _parse_date(eff_date) is None:
         raise ValueError(f"Invalid effective_from date, expected YYYY-MM-DD: {eff_date}")
 
-    reader = VaultReader(vault_path)
+    reader = VaultReader(resolve_vault(vault_path, read_fallback=False))
     norm_scope, kind, project_label = normalize_scope(scope, reader)
 
     target_id = (supersedes or "").strip()
@@ -391,19 +451,21 @@ def create_proposal(
 
     triggers = _parse_use_when(use_when or [])
     if not triggers:
-        triggers = [clean_title]
+        triggers = [clean_title[:100]]
 
     now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
     pid = "prop-" + uuid.uuid4().hex[:12]
     clean_client = (client or "Agent").strip() or "Agent"
 
+    validate_proposal_text(clean_title, clean_body, clean_quote, scope="\n".join((scope, norm_scope, project_label)),
+                           use_when=triggers, client=clean_client)
     with db:
         db.execute(
             """
             INSERT INTO proposals(
                 id, project, path, client, offset, quote, body, date, state,
-                opinion, reviewer, target, base, title, scope, kind, effective_from, use_when, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                opinion, reviewer, target, base, title, scope, kind, effective_from, use_when, created_at, vault_path
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 pid,
@@ -425,6 +487,7 @@ def create_proposal(
                 eff_date,
                 json.dumps(triggers, ensure_ascii=False),
                 now_iso,
+                str(reader.vault),
             ),
         )
     return {
@@ -438,6 +501,15 @@ def create_proposal(
         "state": "pending",
         "client": clean_client,
     }
+
+
+def pending_proposal(db: sqlite3.Connection, proposal_id: str, vault_path: str | Path | None):
+    row = db.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
+    if row and row["vault_path"] and row["vault_path"] != str(resolve_vault(vault_path, read_fallback=False)):
+        raise ValueError("Proposal belongs to a different vault.")
+    if not row or row["state"] not in PENDING_STATES:
+        raise ValueError("Proposal state has changed; please refresh.")
+    return row
 
 
 def edit_proposal(
@@ -454,23 +526,15 @@ def edit_proposal(
     use_when: list[str] | str | None = None,
 ) -> dict:
     """Update a pending proposal in workspace.sqlite3."""
-    row = db.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
-    if not row or row["state"] in CLOSED_STATES:
-        raise ValueError("Proposal state has changed; please refresh.")
+    row = pending_proposal(db, proposal_id, vault_path)
     clean_title = (title or "").strip()
     clean_body = (body or "").strip()
     clean_quote = (quote or "").strip()
-    if not clean_title or len(clean_title) > 120:
-        raise ValueError("Title (summary) must be between 1 and 120 characters.")
-    if not clean_body or len(clean_body) > 8000:
-        raise ValueError("Body must be between 1 and 8000 characters.")
-    validate_proposal_text(clean_title, clean_body, clean_quote)
-
     eff_date = (effective_from or "").strip() or row["effective_from"] or date.today().isoformat()
     if _parse_date(eff_date) is None:
         raise ValueError(f"Invalid effective_from date, expected YYYY-MM-DD: {eff_date}")
 
-    reader = VaultReader(vault_path)
+    reader = VaultReader(resolve_vault(vault_path, read_fallback=False))
     norm_scope, kind, project_label = normalize_scope(scope, reader)
 
     target_id = (supersedes or "").strip()
@@ -485,8 +549,10 @@ def edit_proposal(
 
     triggers = _parse_use_when(use_when or [])
     if not triggers:
-        triggers = [clean_title]
+        triggers = [clean_title[:100]]
 
+    validate_proposal_text(clean_title, clean_body, clean_quote, scope="\n".join((scope, norm_scope, project_label)),
+                           use_when=triggers, client=row["client"] or "")
     with db:
         db.execute(
             """
@@ -513,10 +579,8 @@ def edit_proposal(
     return {"id": proposal_id, "state": "pending"}
 
 
-def ignore_proposal(db: sqlite3.Connection, proposal_id: str) -> None:
-    row = db.execute("SELECT state FROM proposals WHERE id=?", (proposal_id,)).fetchone()
-    if not row or row["state"] in CLOSED_STATES:
-        raise ValueError("Proposal state has changed; please refresh.")
+def ignore_proposal(db: sqlite3.Connection, proposal_id: str, vault_path: str | Path | None = None) -> None:
+    pending_proposal(db, proposal_id, vault_path)
     with db:
         db.execute("UPDATE proposals SET state='ignored' WHERE id=?", (proposal_id,))
 
@@ -525,8 +589,8 @@ def list_proposals(db: sqlite3.Connection, reader: VaultReader) -> list[dict]:
     placeholders = ",".join("?" for _ in CLOSED_STATES)
     rows = db.execute(
         f"SELECT * FROM proposals WHERE state NOT IN ({placeholders}) "
-        "ORDER BY created_at DESC, date DESC, rowid DESC",
-        tuple(CLOSED_STATES),
+        "AND vault_path IN (?, '') ORDER BY created_at DESC, date DESC, rowid DESC",
+        (*CLOSED_STATES, str(reader.vault)),
     ).fetchall()
     out = []
     for row in rows:
@@ -554,8 +618,9 @@ def list_proposals(db: sqlite3.Connection, reader: VaultReader) -> list[dict]:
 
 def _make_project_id(title: str, existing_ids: set[str]) -> str:
     ascii_slug = re.sub(r"[^a-z0-9]+", "-", title.casefold()).strip("-")
+    ascii_slug = ascii_slug[:32]
     if ascii_slug and len(ascii_slug) >= 2 and ascii_slug not in existing_ids:
-        return ascii_slug[:32]
+        return ascii_slug
     digest = hashlib.sha256(title.strip().encode("utf-8")).hexdigest()[:16]
     candidate = f"p-{digest}"
     idx = 1
@@ -565,31 +630,7 @@ def _make_project_id(title: str, existing_ids: set[str]) -> str:
     return candidate
 
 
-def _ensure_project_start(
-    vault: Path, reader: VaultReader, title: str
-) -> tuple[str, Path, bool]:
-    info = reader.resolve_project(title)
-    if info:
-        return info.project_id, info.start_path, False
-    pid = _make_project_id(title, set(reader.projects.keys()))
-    proj_dir = vault / "projects" / pid
-    proj_dir.mkdir(parents=True, exist_ok=True)
-    start_path = proj_dir / "START.md"
-    sources_name = _vault_sources_file(vault).name
-    meta = {
-        "project_id": pid,
-        "title": title,
-        "aliases": [title],
-        "paths": [],
-    }
-    body = f"# {title}\n\n[Sources](../../{sources_name})"
-    start_path.write_text(dump_frontmatter(meta, body), encoding="utf-8")
-    return pid, start_path, True
-
-
-def _regenerate_project_index(vault: Path) -> Path:
-    reader = VaultReader(vault)
-    index_path = _vault_index_file(vault)
+def _project_index(reader: VaultReader, index_path: Path) -> str:
     if index_path.name == "项目索引.md":
         lines = ["# 项目索引", "", "由库内项目首页生成。打开项目即可查看现行和历史记忆。", ""]
     else:
@@ -599,15 +640,13 @@ def _regenerate_project_index(vault: Path) -> Path:
     ):
         safe_title = re.sub(r"([\\\[\]])", r"\\\1", " ".join(info.title.splitlines()))
         lines.append(f"- [{safe_title}](projects/{pid}/START.md)")
-    index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return index_path
+    return "\n".join(lines) + "\n"
 
 
-def _append_project_card_link(start_path: Path, summary: str, card_id: str) -> None:
-    text = start_path.read_text(encoding="utf-8")
+def _append_project_card_link(text: str, summary: str, card_id: str) -> str:
     target_link = f"{card_id}.md"
     if target_link in text:
-        return
+        return text
     meta, body = parse_frontmatter(text)
     safe_label = re.sub(r"([\\\[\]])", r"\\\1", " ".join(summary.splitlines()))
     bullet = f"- [{safe_label}]({target_link})"
@@ -621,11 +660,12 @@ def _append_project_card_link(start_path: Path, summary: str, card_id: str) -> N
     if insert_at + 1 < len(lines) and lines[insert_at + 1].strip():
         lines.insert(insert_at + 1, "")
     new_body = "\n".join(lines).strip()
-    start_path.write_text(dump_frontmatter(meta, new_body), encoding="utf-8")
+    return dump_frontmatter(meta, new_body)
 
 
 def _append_evidence_event(
-    vault: Path,
+    existing: str,
+    evidence_path: Path,
     *,
     event_id: str,
     project: str,
@@ -633,8 +673,7 @@ def _append_evidence_event(
     actor: str,
     text: str,
     location: str,
-) -> Path:
-    evidence_path = _vault_sources_file(vault)
+) -> str:
     row = json.dumps(
         {
             "event_id": event_id,
@@ -647,16 +686,14 @@ def _append_evidence_event(
         },
         ensure_ascii=False,
     )
-    if not evidence_path.is_file():
+    if not existing:
         header = (
             "# 来源记录\n\n通过事件 ID 查找正式记忆的原话和来源。\n\n```jsonl\n"
             if evidence_path.name == "来源记录.md"
             else "# Sources\n\nTrace published memory cards back to original quotes and events.\n\n```jsonl\n"
         )
-        evidence_path.write_text(header + row + "\n```\n", encoding="utf-8")
-        return evidence_path
+        return header + row + "\n```\n"
 
-    existing = evidence_path.read_text(encoding="utf-8")
     head, fence, rest = existing.partition("\n```jsonl\n")
     if fence:
         if rest.startswith("```"):
@@ -667,13 +704,9 @@ def _append_evidence_event(
             jsonl_body, end_fence, tail = rest, "\n```", "\n"
         prefix = jsonl_body.rstrip("\n")
         updated_body = (prefix + "\n" + row) if prefix else row
-        evidence_path.write_text(head + fence + updated_body + end_fence + tail, encoding="utf-8")
-    else:
-        suffix = "" if existing.endswith("\n") else "\n"
-        evidence_path.write_text(
-            existing + suffix + "\n```jsonl\n" + row + "\n```\n", encoding="utf-8"
-        )
-    return evidence_path
+        return head + fence + updated_body + end_fence + tail
+    suffix = "" if existing.endswith("\n") else "\n"
+    return existing + suffix + "\n```jsonl\n" + row + "\n```\n"
 
 
 def _generate_card_id(scope: str, kind: str, title: str, body: str, proposal_id: str, existing_ids: set[str]) -> str:
@@ -705,53 +738,48 @@ def publish_proposals(
     if not proposal_ids or len(set(proposal_ids)) != len(proposal_ids):
         raise ValueError("Select at least one pending proposal to publish.")
 
-    vault = resolve_vault(vault_path)
-    touched: list[Path] = []
+    vault = resolve_vault(vault_path, read_fallback=False)
+    reader = VaultReader(vault)
+    existing_ids = set(reader.cards)
+    targets: set[str] = set()
+    planned: dict[Path, str] = {}
     published_cards: list[dict] = []
     new_project_created = False
 
-    for pid_key in proposal_ids:
-        row = db.execute("SELECT * FROM proposals WHERE id=?", (pid_key,)).fetchone()
-        if not row or row["state"] in CLOSED_STATES:
-            raise ValueError("Selected proposal state has changed; please refresh.")
+    def current_text(path: Path) -> str:
+        if path in planned:
+            return planned[path]
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
-        p = dict(row)
+    for pid_key in proposal_ids:
+        p = dict(pending_proposal(db, pid_key, vault))
         title = (p.get("title") or p["body"][:40]).strip()
         body = p["body"].strip()
         quote = (p.get("quote") or "").strip()
-        validate_proposal_text(title, body, quote)
-
-        reader = VaultReader(vault)
         raw_scope = p.get("scope") or (
             f"project/{p['project']}" if p.get("project") else ""
         )
+        triggers = _parse_use_when(p.get("use_when") or "[]") or [title[:100]]
+        validate_proposal_text(title, body, quote, scope=raw_scope, use_when=triggers, client=p.get("client") or "")
         norm_scope, kind, proj_title = normalize_scope(raw_scope, reader)
 
         eff_from = (p.get("effective_from") or p.get("date") or date.today().isoformat()).strip()
         if _parse_date(eff_from) is None:
-            eff_from = date.today().isoformat()
+            raise ValueError(f"Invalid effective_from date: {eff_from}")
 
         if norm_scope.startswith("project/new:"):
             project_name = norm_scope.split("project/new:", 1)[1].strip()
-            proj_id, start_path, created = _ensure_project_start(vault, reader, project_name)
+            proj_id = _make_project_id(project_name, set(reader.projects))
+            start_path = vault_child(vault, vault / "projects" / proj_id / "START.md")
+            meta = {"project_id": proj_id, "title": project_name, "aliases": [project_name], "paths": []}
+            project_body = f"# {project_name}\n\n[Sources](../../{_vault_sources_file(vault).name})"
+            planned[start_path] = dump_frontmatter(meta, project_body)
+            reader.projects[proj_id] = ProjectInfo(proj_id, project_name, start_path=start_path)
             norm_scope = f"project/{proj_id}"
-            touched.append(start_path)
-            if created:
-                new_project_created = True
-            reader = VaultReader(vault)
-        elif norm_scope.startswith("project/"):
-            proj_id = norm_scope.split("/", 1)[1]
-            if proj_id not in reader.projects:
-                proj_id, start_path, created = _ensure_project_start(vault, reader, proj_title or proj_id)
-                norm_scope = f"project/{proj_id}"
-                touched.append(start_path)
-                if created:
-                    new_project_created = True
-                reader = VaultReader(vault)
+            new_project_created = True
 
-        new_id = _generate_card_id(
-            norm_scope, kind, title, body, p["id"], set(reader.cards.keys())
-        )
+        new_id = _generate_card_id(norm_scope, kind, title, body, p["id"], existing_ids)
+        existing_ids.add(new_id)
 
         target_id = (p.get("target") or "").strip()
         supersedes_list: list[str] = []
@@ -762,6 +790,13 @@ def publish_proposals(
                 raise ValueError(f"Card to supersede not found: {target_id}")
             if old_card.scope != norm_scope:
                 raise ValueError("Superseded card belongs to a different scope.")
+            if old_card.status != "active":
+                raise ValueError("Only an active card may be superseded.")
+            if target_id in targets:
+                raise ValueError("Multiple drafts supersede the same target card.")
+            targets.add(target_id)
+            if p["base"] and hashlib.sha256(old_card.body.encode("utf-8")).hexdigest()[:10] != p["base"]:
+                raise ValueError("Target card changed since draft creation; please review and update the draft.")
             supersedes_list.append(target_id)
             subj = old_card.subject_key
 
@@ -774,10 +809,7 @@ def publish_proposals(
                 old_meta["effective_until"] = (new_from - timedelta(days=1)).isoformat()
             else:
                 old_meta["effective_until"] = eff_from
-            old_card.path.write_text(
-                dump_frontmatter(old_meta, old_card.body), encoding="utf-8"
-            )
-            touched.append(old_card.path)
+            planned[vault_child(vault, old_card.path)] = dump_frontmatter(old_meta, old_card.body)
 
         if not subj:
             scope_key = norm_scope.split("/", 1)[1] if norm_scope.startswith("project/") else norm_scope
@@ -787,8 +819,9 @@ def publish_proposals(
         if quote:
             event_id = f"ev-{p['id']}"
             ev_proj = norm_scope.split("/", 1)[1] if norm_scope.startswith("project/") else norm_scope
-            ev_path = _append_evidence_event(
-                vault,
+            ev_path = vault_child(vault, _vault_sources_file(vault))
+            planned[ev_path] = _append_evidence_event(
+                current_text(ev_path), ev_path,
                 event_id=event_id,
                 project=ev_proj,
                 at=eff_from,
@@ -796,12 +829,7 @@ def publish_proposals(
                 text=quote,
                 location=f"MemoryS / {p.get('client') or 'manual'}",
             )
-            touched.append(ev_path)
             source_refs.append(f"event:{event_id}")
-
-        triggers = _parse_use_when(p.get("use_when") or "[]")
-        if not triggers:
-            triggers = [title]
 
         card_meta: dict = {
             "id": new_id,
@@ -821,31 +849,49 @@ def publish_proposals(
 
         if norm_scope.startswith("project/"):
             proj_id = norm_scope.split("/", 1)[1]
-            card_dir = vault / "projects" / proj_id
-            card_dir.mkdir(parents=True, exist_ok=True)
-            card_path = card_dir / f"{new_id}.md"
-            card_path.write_text(dump_frontmatter(card_meta, body), encoding="utf-8")
-            touched.append(card_path)
-            start_path = card_dir / "START.md"
-            if start_path.is_file():
-                _append_project_card_link(start_path, title, new_id)
-                touched.append(start_path)
+            start_path = vault_child(vault, reader.projects[proj_id].start_path)
+            card_dir = start_path.parent
+            planned[start_path] = _append_project_card_link(current_text(start_path), title, new_id)
         else:
-            folder = norm_scope.split("/", 1)[1]
-            card_dir = vault / "notes" / folder
-            card_dir.mkdir(parents=True, exist_ok=True)
-            card_path = card_dir / f"{new_id}.md"
-            card_path.write_text(dump_frontmatter(card_meta, body), encoding="utf-8")
-            touched.append(card_path)
+            card_dir = vault / "notes" / norm_scope.split("/", 1)[1]
+        card_path = vault_child(vault, card_dir / f"{new_id}.md")
+        if card_path.exists() or card_path in planned:
+            raise ValueError(f"Card file already exists: {card_path}")
+        planned[card_path] = dump_frontmatter(card_meta, body)
 
         published_cards.append({"id": new_id, "summary": title, "scope": norm_scope, "proposal_id": p["id"]})
 
     if new_project_created:
-        touched.append(_regenerate_project_index(vault))
+        index_path = vault_child(vault, _vault_index_file(vault))
+        planned[index_path] = _project_index(reader, index_path)
 
     summary_names = ", ".join(f"{c['summary']} ({c['id']})" for c in published_cards)
     commit_msg = f"memorys: publish {summary_names}"
-    commit_hash = commit_vault_files(vault, touched, commit_msg)
+    originals = {path: path.read_bytes() if path.exists() else None for path in planned}
+    attempted = []
+    created_dirs = []
+    try:
+        for path, content in planned.items():
+            missing = []
+            parent = path.parent
+            while not parent.exists():
+                missing.append(parent)
+                parent = parent.parent
+            for directory in reversed(missing):
+                directory.mkdir()
+                created_dirs.append(directory)
+            attempted.append(path)
+            path.write_text(content, encoding="utf-8")
+        commit_hash = commit_vault_files(vault, list(planned), commit_msg)
+    except BaseException:
+        for path in reversed(attempted):
+            if originals[path] is None:
+                path.unlink(missing_ok=True)
+            elif not path.exists() or path.read_bytes() != originals[path]:
+                path.write_bytes(originals[path])
+        for directory in reversed(created_dirs):
+            directory.rmdir()
+        raise
 
     with db:
         for item in published_cards:
@@ -863,7 +909,7 @@ def publish_proposals(
 
 def archive_card(vault_path: str | Path | None, card_id: str) -> dict:
     """Mark an active card as archived and commit to Git immediately."""
-    vault = resolve_vault(vault_path)
+    vault = resolve_vault(vault_path, read_fallback=False)
     reader = VaultReader(vault)
     card = reader.cards.get((card_id or "").strip())
     if not card:
@@ -872,7 +918,7 @@ def archive_card(vault_path: str | Path | None, card_id: str) -> dict:
         raise ValueError("Memory card is already archived.")
     meta = dict(card.meta)
     meta["status"] = "archived"
-    card.path.write_text(dump_frontmatter(meta, card.body), encoding="utf-8")
+    vault_child(vault, card.path).write_text(dump_frontmatter(meta, card.body), encoding="utf-8")
     commit_hash = commit_vault_files(
         vault, [card.path], f"memorys: archive {card.summary} ({card.card_id})"
     )
@@ -886,8 +932,9 @@ def update_project_meta(
     paths: list[str] | str,
 ) -> dict:
     """Update a project's START.md aliases and local paths and commit to Git."""
-    vault = resolve_vault(vault_path)
+    vault = resolve_vault(vault_path, read_fallback=False)
     reader = VaultReader(vault)
+    validate_project_id(project_id)
     info = reader.resolve_project(project_id)
     if not info:
         raise ValueError(f"Project not found: {project_id}")
@@ -913,7 +960,7 @@ def update_project_meta(
         if k not in meta:
             meta[k] = v
 
-    info.start_path.write_text(dump_frontmatter(meta, body), encoding="utf-8")
+    vault_child(vault, info.start_path).write_text(dump_frontmatter(meta, body), encoding="utf-8")
     commit_hash = commit_vault_files(
         vault, [info.start_path], f"memorys: update project {info.title} ({info.project_id})"
     )

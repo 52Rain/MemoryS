@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sys
 from typing import Any
@@ -79,7 +80,7 @@ def _looks_like_vault(path: Path) -> bool:
     )
 
 
-def resolve_vault(vault_path: str | Path | None = None) -> Path:
+def resolve_vault(vault_path: str | Path | None = None, *, read_fallback: bool = True) -> Path:
     """Resolve the active MemoryS vault directory in deterministic priority order."""
     if vault_path is not None and str(vault_path).strip():
         return Path(vault_path).expanduser().resolve()
@@ -95,20 +96,45 @@ def resolve_vault(vault_path: str | Path | None = None) -> Path:
     env_root = os.environ.get("MEMORYS_PROJECT_ROOT", "").strip()
     if env_root:
         candidate = (Path(env_root).expanduser().resolve() / "MemoryS").resolve()
-        if candidate.is_dir():
+        if _looks_like_vault(candidate):
             return candidate
 
-    # Fallback: check ~/MemoryS or local demo vault
-    home_default = (Path.home() / "MemoryS").resolve()
-    if _looks_like_vault(home_default):
-        return home_default
+    home_default = (Path.home() / "memorys-vault").resolve()
+    for candidate in (home_default, Path.home() / "MemoryS"):
+        if _looks_like_vault(candidate):
+            return candidate.resolve()
 
     repo_root = Path(__file__).resolve().parents[1]
     demo_vault = (repo_root / "examples" / "demo-vault").resolve()
-    if _looks_like_vault(demo_vault):
+    if read_fallback and _looks_like_vault(demo_vault):
         return demo_vault
 
     return home_default
+
+
+def vault_child(vault: Path, path: Path) -> Path:
+    root = vault.resolve()
+    resolved = path.resolve()
+    if resolved == root or not resolved.is_relative_to(root) or ".git" in resolved.relative_to(root).parts:
+        raise ValueError(f"Path must be inside the vault content directory: {path}")
+    return resolved
+
+
+def is_memorys_hook(command: str) -> bool:
+    """Recognize the hook executable or script path in existing client settings."""
+    try:
+        args = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        return False
+    current_script = str(Path(__file__).with_name("recall_hook.py")).casefold().replace("\\", "/")
+    for arg in args:
+        path = arg.strip('"').casefold().replace("\\", "/")
+        name = path.rsplit("/", 1)[-1]
+        if name in {"memorys-hook", "memorys-hook.exe"}:
+            return True
+        if name == "recall_hook.py" and (path == current_script or "memorys" in path):
+            return True
+    return False
 
 
 def find_git() -> str:

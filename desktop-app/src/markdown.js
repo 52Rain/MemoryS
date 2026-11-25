@@ -176,7 +176,7 @@ export function renderMarkdown(source) {
     }
 
     // Fenced code block
-    const fence = trimmed.match(/^```([\w-]*)\s*$/);
+    const fence = trimmed.match(/^```(.*)$/);
     if (fence) {
       const codeLines = [];
       i += 1;
@@ -219,9 +219,11 @@ export function renderMarkdown(source) {
     // List
     if (/^[ \t]*(?:[-*+]|\d+[.)])\s+/.test(line)) {
       const parsed = parseListBlock(lines, i);
-      out.push(parsed.html);
-      i = parsed.nextIdx;
-      continue;
+      if (parsed.nextIdx > i) {
+        out.push(parsed.html);
+        i = parsed.nextIdx;
+        continue;
+      }
     }
 
     // Paragraph (stop before special blocks)
@@ -240,6 +242,10 @@ export function renderMarkdown(source) {
         break;
       }
       paraLines.push(curTrim);
+      i += 1;
+    }
+    if (paraLines.length === 0) {
+      paraLines.push(trimmed);
       i += 1;
     }
     out.push(`<p>${paraLines.map((l) => renderInline(l)).join('<br />')}</p>`);

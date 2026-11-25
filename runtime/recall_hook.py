@@ -1,6 +1,7 @@
 """UserPromptSubmit recall hook: pure local, <50ms, dual-layer recall from MemoryS Vault."""
 from __future__ import annotations
 
+import argparse
 from datetime import date
 import json
 from pathlib import Path
@@ -139,12 +140,15 @@ def recall(payload: dict, vault_path: str | Path | None = None) -> dict:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--vault")
+    args = parser.parse_args()
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
         if not isinstance(payload, dict):
             payload = {}
-        out = recall(payload)
+        out = recall(payload, vault_path=args.vault or None)
         sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
     except Exception:
         sys.stdout.write("{}\n")

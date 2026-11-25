@@ -31,7 +31,7 @@ MemoryS takes a different stance: **agents propose, humans publish.**
 
 | Capability | MemoryS | Auto-Capture Plugins | Hosted Vector Memory |
 |---|---|---|---|
-| **Human publish gate** | Agents can only queue drafts; vault writes require explicit confirmation + Git commit | Writes automatically | Writes automatically |
+| **Human publish gate** | MCP tools read published cards and queue drafts for human review and Git-backed publication | Writes automatically | Writes automatically |
 | **Temporal rules (`as_of`)** | Native `effective_from` / `effective_until` & `supersedes` chains | Rarely supported | Limited |
 | **Quote provenance (`trace`)** | Every rule can link back to verbatim quotes in `SOURCES.md` | Opaque summaries | Chunk snippets |
 | **Zero-dependency local recall** | Pure Python stdlib, `<50ms` `UserPromptSubmit` hook, no Docker / vector DB | Often requires LLM calls | Cloud or local DB |
@@ -52,20 +52,24 @@ MemoryS takes a different stance: **agents propose, humans publish.**
 
 ## Quick Start (2 Minutes)
 
-Requires **Python 3.10+** and **Git**. No pip packages required for the runtime.
+Install **Python 3.10+** and **Git**. Keep the source checkout and vault in separate directories. The default vault is `~/memorys-vault` on all platforms.
 
 ### 1. Install CLI & Initialize a Demo Vault
 
 ```bash
 git clone https://github.com/52Rain/MemoryS.git
 cd MemoryS
-pip install -e .
+python -m venv .venv
+# macOS / Linux
+source .venv/bin/activate
+# Windows PowerShell: .\.venv\Scripts\Activate.ps1
+python -m pip install .
 
 # Create a Git-backed Obsidian vault with sample temporal rules
-mem init ~/MemoryS --demo
+mem init --demo
 ```
 
-*(You can also run directly without `pip install` via `python3 runtime/memory_cli.py ...`.)*
+Use `python3` or `py -3` to create the venv if that is your Python 3 launcher. A normal install builds a wheel and copies the runtime, demo vault and web console into the environment. To install a prebuilt wheel, pass its path to `python -m pip install`. For development, `python -m pip install -e .` uses the checkout directly. You can also run `python runtime/memory_cli.py ...` from the checkout.
 
 ### 2. Try Point-in-Time (`as_of`) Recall & Provenance
 
@@ -99,11 +103,12 @@ mem connect cursor --apply    # write ~/.cursor/mcp.json
 **Cross-platform Web UI (Linux / Windows / macOS):**
 
 ```bash
-cd desktop-app && npm ci && npm run build && cd ..
 mem ui
 ```
 
-**Native macOS App (Swift + WKWebView + Keychain, no Electron):**
+The wheel includes the HTML, JavaScript and CSS. To use a different local build, run `mem ui --ui-dir /path/to/dist`. In web mode, type the vault path in settings. Opening a card in Obsidian requires the Obsidian URL handler. Linux uses `xdg-open` for external opens.
+
+**Native macOS app** (macOS 13+, Swift command-line tools, Python 3.10+ available as `python3` and Node.js 22+, version 22.12 or later). Its WKWebView shell uses macOS Keychain and a native directory picker. `App.swift` is 235 lines and the separate icon generator is 15 lines. On Linux and Windows, use the web console.
 
 ```bash
 cd desktop-app
@@ -119,7 +124,7 @@ open build.noindex/MemoryS.app
 ### Vault Layout (Obsidian-Ready)
 
 ```text
-~/MemoryS/
+~/memorys-vault/
 ├── START.md                        # Vault entry point
 ├── PROJECTS.md                     # Auto-generated project index
 ├── SOURCES.md                      # Append-only JSONL provenance quotes
@@ -133,6 +138,8 @@ open build.noindex/MemoryS.app
         ├── handoff.md              # Current work-in-progress handoff
         └── d-acme-billing-*.md     # Versioned project decisions
 ```
+
+Existing Chinese vaults can keep `项目索引.md` and `来源记录.md`. Legacy proposal states such as `待确认`, `已发布`, `已忽略` and `受限` are recognized.
 
 ### Dual-Layer Local Recall (`recall_hook.py`)
 
@@ -148,37 +155,48 @@ On every prompt (`UserPromptSubmit`), MemoryS runs purely locally in `<50ms`:
 - `memory_trace(card_id)` — Resolve `source_refs` against `SOURCES.md`.
 - `memory_propose(scope, title, body, effective_from, supersedes, quote, use_when, client)` — Queue a draft proposal for human approval. Built-in guards reject API keys, private keys, and `"do not record"` directives.
 
+**MCP tool-layer read-only isolation** applies to published vault content. These tools queue proposed changes in SQLite. Programs with filesystem access under your OS account retain their existing permissions.
+
 ### Optional AI Conflict Check
 
-In the Review Console, you can optionally configure any OpenAI Chat Completions compatible endpoint to check a pending proposal against active cards in the same scope. **It is purely advisory and never blocks publishing.**
+In the Review Console, you can optionally configure any OpenAI Chat Completions compatible endpoint to check a pending proposal against active cards in the same scope. The selected endpoint receives the draft and active cards from the same scope. You can publish independently of its opinion.
 
 ---
 
 ## Configuration & Environment Variables
 
-Vault resolution priority:
-1. `--vault <path>` CLI flag
-2. `MEMORYS_VAULT` environment variable
-3. `~/.config/memorys/config.json` (`vault_path`, set automatically by `mem init`)
-4. `~/MemoryS` (if present)
+MemoryS checks these locations in order.
 
-Other environment variables:
-- `MEMORYS_APP_DATA`: Override SQLite queue directory (defaults to OS standard app data path).
-- `MEMORYS_API_KEY`: Optional API key for Web UI AI conflict checks (macOS App uses Keychain).
+1. The global `mem --vault <path>` option.
+2. `MEMORYS_VAULT`.
+3. The saved `vault_path` in the MemoryS configuration.
+4. An existing vault at `$MEMORYS_PROJECT_ROOT/MemoryS`, if configured.
+5. An existing `~/memorys-vault`, then the legacy `~/MemoryS`. Read commands in a checkout can fall back to `examples/demo-vault`.
 
----
+| Setting | Purpose |
+|---|---|
+| `MEMORYS_CONFIG_DIR` | Directory for `config.json`. Defaults to `$XDG_CONFIG_HOME/memorys` or `~/.config/memorys` on macOS/Linux and `%APPDATA%\MemoryS` on Windows. |
+| `MEMORYS_APP_DATA` | Directory for SQLite and the workspace lock. Defaults to `~/Library/Application Support/MemoryS` on macOS, `$XDG_DATA_HOME/memorys` or `~/.local/share/memorys` on Linux, and `%LOCALAPPDATA%\MemoryS` on Windows. |
+| `MEMORYS_UI_DIR` | Directory containing built `app.js` and `app.css`. The CLI option `mem ui --ui-dir` takes precedence. |
+| `MEMORYS_API_URL`, `MEMORYS_API_KEY` | Optional web model endpoint and key. The environment key applies to this exact base URL, or to the saved model URL when the variable for the endpoint is unset. |
+| `CODEX_HOME` | Overrides `~/.codex` for `mem connect codex --apply`. |
 
 ## Development & Testing
 
-```bash
-# Run full unit & integration test suite (pure Python stdlib)
-python3 -B -m unittest discover -v -s tests
+Run the Python suite from the checkout. Building the UI requires **Node.js 22+ (22.12 or later)** and npm.
 
-# Build frontend console
-cd desktop-app && npm ci && npm run build
+```bash
+python -B -m unittest discover -v -s tests
+python -B tests/check_install.py
+node tests/check_markdown.mjs
+cd desktop-app
+npm ci
+npm run build
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) for contribution guidelines and security model details.
+For a release, copy the rebuilt `dist/app.js` and `dist/app.css` into `runtime/ui/`. The wheel ships these tracked files. CI compares them against a fresh build.
+
+See the contribution guidelines and security model. [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 ## License
 

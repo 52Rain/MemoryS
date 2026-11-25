@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import socket
 import subprocess
 import sys
 from urllib.parse import quote, urlsplit
@@ -22,15 +23,11 @@ import webbrowser
 
 _RUNTIME = Path(__file__).resolve().parent
 _REPO_ROOT = _RUNTIME.parent
-_SERVICE = _REPO_ROOT / "desktop-app" / "service"
-for p in (_RUNTIME, _SERVICE):
-    if p.is_dir() and str(p) not in sys.path:
-        sys.path.insert(0, str(p))
-
-import backend as b  # noqa: E402
-from config import app_data_dir, resolve_vault, workspace_lock  # noqa: E402
+from runtime import service_backend as b
+from runtime.config import app_data_dir, resolve_vault, workspace_lock
 
 
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
@@ -41,21 +38,24 @@ MIME_TYPES = {
 }
 
 
-def _find_ui_dir() -> Path:
-    candidates = [
+def _find_ui_dir(ui_dir: Path | None = None) -> Path:
+    override = ui_dir or os.environ.get("MEMORYS_UI_DIR")
+    candidates = [Path(override).expanduser()] if override else [
         _REPO_ROOT / "desktop-app" / "dist",
-        _REPO_ROOT / "runtime" / "ui",
+        _RUNTIME / "ui",
     ]
     for c in candidates:
         if (c / "app.js").is_file() and (c / "app.css").is_file():
-            return c
+            return c.resolve()
     raise FileNotFoundError(
         "Built UI assets not found (desktop-app/dist/app.js). Run `cd desktop-app && npm ci && npm run build`."
     )
 
 
-def _open_external(path_str: str, mode: str) -> dict:
+def _open_external(path_str: str, mode: str, vault: Path) -> dict:
     target = Path(path_str).expanduser().resolve()
+    if not target.is_relative_to(vault.resolve()):
+        raise ValueError("Path is outside the active vault.")
     if not target.exists():
         raise ValueError(f"File not found: {target}")
     if mode == "obsidian":
@@ -83,17 +83,29 @@ def create_server(
     data_dir: Path | None = None,
     ui_dir: Path | None = None,
 ) -> tuple[ThreadingHTTPServer, str]:
-    ui_root = ui_dir or _find_ui_dir()
+    if host not in LOOPBACK_HOSTS:
+        raise ValueError("MemoryS requires a loopback host.")
+    ui_root = _find_ui_dir(ui_dir)
     public_index = _REPO_ROOT / "desktop-app" / "public" / "index.html"
-    index_src = public_index if public_index.is_file() else (ui_root / "index.html")
+    index_src = public_index
+    if not index_src.is_file():
+        index_src = (ui_root / "index.html").resolve()
+        if not index_src.is_relative_to(ui_root) or not index_src.is_file():
+            index_src = _RUNTIME / "ui_index.html"
     token = secrets.token_urlsafe(24)
-    vault = resolve_vault(vault_path)
+    vault = resolve_vault(vault_path, read_fallback=False)
     base_data = data_dir or app_data_dir()
     session_keys: dict[str, str] = {}
 
-    def get_key_for_url(url_str: str) -> str:
+    def get_key_for_url(db, url_str: str) -> str:
         norm = (url_str or "").strip().rstrip("/")
-        return session_keys.get(norm) or os.environ.get("MEMORYS_API_KEY", "").strip()
+        if norm in session_keys:
+            return session_keys[norm]
+        saved = b.get_setting(db, "model", {})
+        bound_url = os.environ.get("MEMORYS_API_URL") or saved.get("url", "")
+        if norm and norm == bound_url.strip().rstrip("/"):
+            return os.environ.get("MEMORYS_API_KEY", "").strip()
+        return ""
 
     def build_index_html() -> bytes:
         html = index_src.read_text(encoding="utf-8")
@@ -118,7 +130,18 @@ def create_server(
             self.end_headers()
             self.wfile.write(body)
 
+        def _valid_host(self) -> bool:
+            hosts = self.headers.get_all("Host") or []
+            port = self.server.server_port
+            allowed = {"localhost", "127.0.0.1", "[::1]"}
+            if len(hosts) == 1 and hosts[0].lower() in (allowed | {f"{h}:{port}" for h in allowed}):
+                return True
+            self._send(403, b"Invalid Host", "text/plain")
+            return False
+
         def do_GET(self) -> None:
+            if not self._valid_host():
+                return
             parsed = urlsplit(self.path)
             rel = parsed.path.lstrip("/")
             if rel in ("", "index.html"):
@@ -128,62 +151,57 @@ def create_server(
                 self._send(403, b"Forbidden", "text/plain; charset=utf-8")
                 return
             target = (ui_root / rel).resolve()
-            if not str(target).startswith(str(ui_root.resolve())) or not target.is_file():
+            if not target.is_relative_to(ui_root.resolve()) or not target.is_file():
                 self._send(404, b"Not Found", "text/plain; charset=utf-8")
                 return
             mime = MIME_TYPES.get(target.suffix.lower(), "application/octet-stream")
             self._send(200, target.read_bytes(), mime)
 
         def do_POST(self) -> None:
+            nonlocal vault
+            if not self._valid_host():
+                return
             if urlsplit(self.path).path != "/api/rpc":
                 self._send(404, b'{"ok":false,"error":"Not found"}', MIME_TYPES[".json"])
                 return
             if self.headers.get("X-MemoryS-Token") != token:
                 self._send(403, b'{"ok":false,"error":"Invalid session token"}', MIME_TYPES[".json"])
                 return
-            origin = self.headers.get("Origin", "")
-            if origin:
-                orig_host = urlsplit(origin).hostname
-                if orig_host not in {"127.0.0.1", "localhost", "::1"}:
-                    self._send(403, b'{"ok":false,"error":"Cross-origin request blocked"}', MIME_TYPES[".json"])
-                    return
+            origins = self.headers.get_all("Origin")
+            hostname = urlsplit("//" + self.headers["Host"]).hostname
+            authority = "[::1]" if hostname == "::1" else hostname
+            if origins is not None and origins != [f"http://{authority}:{self.server.server_port}"]:
+                self._send(403, b'{"ok":false,"error":"Cross-origin request blocked"}', MIME_TYPES[".json"])
+                return
 
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length > 2_000_000:
+                if not 0 <= length <= 2_000_000:
                     raise ValueError("Request payload too large.")
                 req = json.loads(self.rfile.read(length).decode("utf-8"))
                 action = str(req.get("action") or "")
                 args = dict(req.get("args") or {})
                 entered_key = str(args.pop("key", "") or "").strip()
 
-                if action == "openExternal":
-                    data = _open_external(str(args.get("path") or ""), str(args.get("mode") or "obsidian"))
-                elif action == "pickDirectory":
-                    data = {"cancelled": True, "unsupported": True}
-                else:
-                    with contextlib.closing(b.connect(base_data)) as db, workspace_lock(base_data):
-                        active_key = entered_key
-                        if action == "saveConfig":
-                            cfg = b.config(args)
-                            if entered_key:
-                                session_keys[cfg["url"]] = entered_key
-                            data = b.dispatch(db, action, args, "", vault=vault)
-                        elif action == "test":
-                            cfg = b.config(args)
-                            active_key = entered_key or get_key_for_url(cfg["url"])
-                            data = b.dispatch(db, action, args, active_key, vault=vault)
-                        elif action == "reviewProposal":
-                            cfg = b.dispatch(db, "config", {}, "", vault=vault)
-                            active_key = get_key_for_url(cfg["url"])
-                            data = b.dispatch(db, action, args, active_key, vault=vault)
-                        elif action == "snapshot":
-                            data = b.dispatch(db, action, args, "", vault=vault)
-                            cfg = data.get("config") or {}
-                            data["hasKey"] = bool(get_key_for_url(cfg.get("url", "")))
-                            data["runtime_mode"] = "web"
-                        else:
-                            data = b.dispatch(db, action, args, "", vault=vault)
+                with contextlib.closing(b.connect(base_data)) as db:
+                    if action in b.MODEL_ACTIONS:
+                        data = b.dispatch(db, action, args, entered_key, vault=vault,
+                                          lock=lambda: workspace_lock(base_data), key_for_url=get_key_for_url)
+                    else:
+                        with workspace_lock(base_data):
+                            if action == "openExternal":
+                                data = _open_external(str(args.get("path") or ""), str(args.get("mode") or "obsidian"), vault)
+                            elif action == "pickDirectory":
+                                data = {"cancelled": True, "unsupported": True}
+                            else:
+                                data = b.dispatch(db, action, args, "", vault=vault)
+                                if action == "saveConfig" and entered_key:
+                                    session_keys[data["url"]] = entered_key
+                                elif action == "snapshot":
+                                    data["hasKey"] = bool(get_key_for_url(db, data["config"]["url"]))
+                                    data["runtime_mode"] = "web"
+                                elif action == "setVaultPath":
+                                    vault = Path(data["vault_path"])
 
                 body = json.dumps({"ok": True, "data": data}, ensure_ascii=False).encode("utf-8")
                 self._send(200, body, MIME_TYPES[".json"])
@@ -194,7 +212,11 @@ def create_server(
         def log_message(self, format: str, *args) -> None:
             pass
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    class IPv6Server(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+    server_class = IPv6Server if host == "::1" else ThreadingHTTPServer
+    server = server_class((host, port), Handler)
     return server, token
 
 
@@ -202,12 +224,13 @@ def serve_web_ui(
     port: int = 8765,
     vault_path: str | Path | None = None,
     open_browser: bool = True,
+    ui_dir: Path | None = None,
 ) -> int:
-    server, _token = create_server(host="127.0.0.1", port=port, vault_path=vault_path)
+    server, _token = create_server(host="127.0.0.1", port=port, vault_path=vault_path, ui_dir=ui_dir)
     actual_port = server.server_address[1]
     url = f"http://127.0.0.1:{actual_port}/"
     print(f"MemoryS Web UI running at {url}")
-    print(f"Vault: {resolve_vault(vault_path)}")
+    print(f"Vault: {resolve_vault(vault_path, read_fallback=False)}")
     print("Press Ctrl+C to stop.")
     if open_browser:
         webbrowser.open(url)

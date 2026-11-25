@@ -13,9 +13,9 @@ from pathlib import Path
 import re
 
 try:
-    from runtime.config import resolve_vault
+    from runtime.config import resolve_vault, vault_child
 except ImportError:
-    from config import resolve_vault
+    from config import resolve_vault, vault_child
 
 
 def _strip_comment(text: str) -> str:
@@ -213,7 +213,7 @@ def _parse_date(value) -> date | None:
     if isinstance(value, date):
         return value
     text = str(value).strip()
-    if not text:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
         return None
     try:
         return date.fromisoformat(text)
@@ -232,6 +232,12 @@ def _tokenize(query: str) -> set[str]:
         elif len(term) > 1 and term.isascii() and ("-" in term or "_" in term):
             terms.update(part for part in re.split(r"[-_]+", term) if len(part) >= 2)
     return terms
+
+
+def validate_project_id(identifier: str) -> str:
+    if not identifier or identifier == "." or any(part in identifier for part in ("/", "\\", "..", ":")):
+        raise ValueError(f"Invalid project ID: {identifier}")
+    return identifier
 
 
 def subject_key(project: str, topic: str) -> str:
@@ -409,8 +415,9 @@ class VaultReader:
         projects_dir = self.vault / "projects"
         if projects_dir.is_dir():
             for start_file in sorted(projects_dir.glob("*/START.md")):
-                meta, body = parse_frontmatter(start_file.read_text(encoding="utf-8"))
+                meta, body = parse_frontmatter(vault_child(self.vault, start_file).read_text(encoding="utf-8"))
                 pid = str(meta.get("project_id") or start_file.parent.name).strip()
+                validate_project_id(pid)
                 title = str(meta.get("title") or pid).strip()
                 aliases = _as_str_list(meta.get("aliases"))
                 paths = _as_str_list(meta.get("paths"))
@@ -438,7 +445,7 @@ class VaultReader:
                 self._load_card_file(md_file, default_scope=f"shared/{folder_name}")
 
     def _load_card_file(self, md_file: Path, default_scope: str) -> None:
-        raw = md_file.read_text(encoding="utf-8")
+        raw = vault_child(self.vault, md_file).read_text(encoding="utf-8")
         meta, body = parse_frontmatter(raw)
         if not meta.get("id"):
             meta["id"] = md_file.stem
@@ -446,7 +453,7 @@ class VaultReader:
             meta["scope"] = default_scope
         scope = str(meta.get("scope") or "")
         if scope.startswith("project/"):
-            pid = scope.split("/", 1)[1]
+            pid = validate_project_id(scope.split("/", 1)[1])
             info = self.projects.get(pid)
             project_title = info.title if info else pid
         else:
@@ -467,6 +474,7 @@ class VaultReader:
             return None
         if key.startswith("project/"):
             key = key.split("/", 1)[1]
+        validate_project_id(key)
         if key in self.projects:
             return self.projects[key]
         norm_key = _norm_token(key)
@@ -524,7 +532,7 @@ class VaultReader:
         if scope in SCOPE_LABELS:
             return SCOPE_LABELS[scope]
         if scope.startswith("project/"):
-            pid = scope.split("/", 1)[1]
+            pid = validate_project_id(scope.split("/", 1)[1])
             info = self.projects.get(pid)
             return info.title if info else pid
         return scope
@@ -539,6 +547,8 @@ class VaultReader:
         s = (scope or "").strip()
         if not s:
             return ""
+        if s.casefold() in SCOPE_LABELS:
+            return s.casefold()
         aliases = {
             "preferences": "shared/preferences",
             "preference": "shared/preferences",
@@ -653,10 +663,11 @@ class VaultReader:
         return data
 
     def handoff(self, project_id: str) -> dict | None:
+        validate_project_id(project_id)
         info = self.resolve_project(project_id)
         if not info:
             return None
-        handoff_file = info.start_path.parent / "handoff.md"
+        handoff_file = vault_child(self.vault, info.start_path.parent / "handoff.md")
         if not handoff_file.is_file():
             return None
         return {
@@ -676,7 +687,7 @@ class VaultReader:
             evidence_md = self.vault / fname
             if not evidence_md.is_file():
                 continue
-            text = evidence_md.read_text(encoding="utf-8")
+            text = vault_child(self.vault, evidence_md).read_text(encoding="utf-8")
             head, fence, rest = text.partition("\n```jsonl\n")
             if not fence:
                 continue
@@ -699,7 +710,7 @@ class VaultReader:
         # Optional standalone evidence JSONL inside the vault
         vault_jsonl = self.vault / "evidence" / "events.jsonl"
         if vault_jsonl.is_file():
-            for idx, line in enumerate(vault_jsonl.read_text(encoding="utf-8").splitlines(), start=1):
+            for idx, line in enumerate(vault_child(self.vault, vault_jsonl).read_text(encoding="utf-8").splitlines(), start=1):
                 line = line.strip()
                 if not line:
                     continue
