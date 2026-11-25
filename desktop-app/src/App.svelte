@@ -954,7 +954,7 @@
         <span>Hook: N/A</span>
        </div>
       </div>
-      <p class="section-desc" style="margin-top:12px;margin-bottom:0">{t.connectTip}</p>
+      <p class="section-desc" style="margin-top:12px;margin-bottom:0">{#each t.connectTip as part}{#if typeof part === 'string'}{part}{:else}<code>{part.code}</code>{/if}{/each}</p>
      </section>
 
      <section class="settings">
