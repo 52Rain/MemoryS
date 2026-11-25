@@ -1,0 +1,25 @@
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.obsidian/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Node / Desktop App
+desktop-app/node_modules/
+desktop-app/build.noindex/
+*.app/
+*.dmg
+
+# Local runtime state
+*.sqlite3
+*.lock

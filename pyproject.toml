@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memorys"
+version = "0.1.0"
+description = "Local-first, human-governed memory system for AI coding agents (Obsidian + Git + MCP + Hooks)"
+readme = "README.md"
+authors = [{name = "Aether Sylvan"}]
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = ["ai", "agent", "memory", "mcp", "obsidian", "markdown", "git", "claude-code", "codex"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = []
+
+[project.scripts]
+mem = "runtime.memory_cli:main"
+memorys = "runtime.memory_cli:main"
+memorys-mcp = "runtime.mcp_server:main"
+memorys-hook = "runtime.recall_hook:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["runtime*"]
