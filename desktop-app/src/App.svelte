@@ -35,6 +35,7 @@
   Languages,
  } from 'lucide-svelte';
  import { DICT } from './i18n.js';
+ import { renderMarkdown } from './markdown.js';
 
  function readWebMeta() {
   const el = document.querySelector('meta[name="memorys-web"]');
@@ -50,7 +51,13 @@
  const webMeta = readWebMeta();
  const isNative = !!nativeBridge;
  const route = location.hash.slice(1);
- const todayIso = () => new Date().toISOString().slice(0, 10);
+ const todayIso = () => {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+ };
 
  function initialLang() {
   try {
@@ -90,9 +97,11 @@
  let search = $state('');
  let scopeFilter = $state('');
  let includeHistory = $state(false);
+ let reviewSearch = $state('');
  let cardId = $state('');
  let proposalId = $state('');
  let selected = $state([]);
+ let publishTargets = $state([]);
  let modal = $state('');
  let busy = $state('');
  let notice = $state('');
@@ -130,6 +139,8 @@
 
  let searchInput = $state();
  let dialog = $state();
+ let libraryScroll = $state();
+ let reviewScroll = $state();
  let returnFocus;
  let lock = false;
 
@@ -147,10 +158,18 @@
  );
  const card = $derived(cards.find((c) => c.id === cardId) || cards[0]);
 
- const proposals = $derived(data.proposals);
+ const proposals = $derived(
+  data.proposals.filter((p) => {
+   if (!reviewSearch.trim()) return true;
+   const q = reviewSearch.trim().toLowerCase();
+   return [p.title, p.body, p.scope_label, p.client, p.quote, ...(p.use_when || [])]
+    .join(' ')
+    .toLowerCase()
+    .includes(q);
+  })
+ );
  const proposal = $derived(proposals.find((p) => p.id === proposalId) || proposals[0]);
  const chosen = $derived(data.proposals.filter((p) => selected.includes(p.id)));
- const sections = $derived((card?.body || '').split(/\n\s*\n/).filter(Boolean));
 
  const resolvedFormScope = $derived.by(() => {
   if (formScopeType === 'existing_project') {
@@ -166,8 +185,15 @@
   data.cards.filter((c) => c.status === 'active' && c.scope === resolvedFormScope)
  );
 
- const cleanText = (s) =>
-  s.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/\*\*/g, '').replace(/^[*-] /gm, '• ');
+ $effect(() => {
+  const _cid = card?.id;
+  if (_cid && libraryScroll) libraryScroll.scrollTop = 0;
+ });
+
+ $effect(() => {
+  const _pid = proposal?.id;
+  if (_pid && reviewScroll) reviewScroll.scrollTop = 0;
+ });
 
  function kindText(k) {
   return t.kind[k] || k;
@@ -331,6 +357,9 @@
     quote: proposal.quote || '',
    });
    modal = 'proposalForm';
+  } else if (name === 'publish') {
+   publishTargets = opts.items || chosen;
+   modal = 'publish';
   } else {
    modal = name;
   }
@@ -405,9 +434,13 @@
     notice = t.notices.ignored;
    }
    if (name === 'publish') {
-    const r = await rpc('publish', { ids: chosen.map((x) => x.id) });
+    const ids = publishTargets.map((x) => x.id);
+    const r = await rpc('publish', { ids });
     notice = r.cancelled ? t.notices.cancelled : t.notices.published(r.count, r.revision);
-    if (!r.cancelled) selected = [];
+    if (!r.cancelled) {
+     selected = selected.filter((id) => !ids.includes(id));
+     publishTargets = [];
+    }
    }
    if (name === 'archive' && card) {
     const r = await rpc('archiveCard', { id: card.id });
@@ -600,98 +633,113 @@
     <div class="workspace" class:detailOpen={mobileDetail}>
      <div class="index">
       <div class="list-heading">{t.entriesHeading} <span>{cards.length}</span></div>
-      {#each cards as c}
-       <button
-        class="entry"
-        class:current={card?.id === c.id}
-        class:muted-entry={c.status !== 'active'}
-        onclick={() => {
-         cardId = c.id;
-         mobileDetail = true;
-        }}
-       >
-        <span class="entry-meta">
-         <FileText size={14} />{scopeText(c.scope, c.project)}
-         {#if c.status !== 'active'}
-          <span class="pill status-{c.status}">{statusText(c.status)}</span>
-         {/if}
-        </span>
-        <b>{c.title}</b>
-        <small>{kindText(c.kind)} <i></i> {c.effective_from || '—'}</small>
-       </button>
-      {:else}
-       <p class="inline-empty">
-        {ready ? t.noMatchingCards : t.loadingVault}
-       </p>
-      {/each}
+      <div class="index-list">
+       {#each cards as c}
+        <button
+         class="entry"
+         class:current={card?.id === c.id}
+         class:muted-entry={c.status !== 'active'}
+         onclick={() => {
+          cardId = c.id;
+          mobileDetail = true;
+         }}
+        >
+         <span class="entry-meta">
+          <FileText size={14} />{scopeText(c.scope, c.project)}
+          {#if c.status !== 'active'}
+           <span class="pill status-{c.status}">{statusText(c.status)}</span>
+          {/if}
+         </span>
+         <b>{c.title}</b>
+         <small>{kindText(c.kind)} <i></i> {c.effective_from || '—'}</small>
+        </button>
+       {:else}
+        <p class="inline-empty">
+         {ready ? t.noMatchingCards : t.loadingVault}
+        </p>
+       {/each}
+      </div>
      </div>
 
      <article class="reading">
-      <button class="back" onclick={() => (mobileDetail = false)}>
-       <ArrowLeft size={16} />{t.backToList}
-      </button>
+      <div class="reading-scroll" bind:this={libraryScroll}>
+       <button class="back" onclick={() => (mobileDetail = false)}>
+        <ArrowLeft size={16} />{t.backToList}
+       </button>
+       {#if card}
+        <div class="doc-meta">
+         <span class="type"><FileText size={14} />{kindText(card.kind)}</span>
+         <span>{scopeText(card.scope, card.scope_label)}</span>
+         <span class="pill status-{card.status}">{statusText(card.status)}</span>
+        </div>
+        <h2>{card.title}</h2>
+        <div class="properties">
+         <span>
+          <CalendarDays size={15} />
+          {t.effectiveRange(card.effective_from, card.effective_until)}
+         </span>
+         <span><GitCommitHorizontal size={15} />{card.version}</span>
+        </div>
+
+        {#if card.use_when?.length}
+         <div class="tags-row">
+          <Tag size={14} />
+          {#each card.use_when as kw}
+           <span class="tag-chip">{kw}</span>
+          {/each}
+         </div>
+        {/if}
+
+        <div class="md-body">{@html renderMarkdown(card.body)}</div>
+
+        {#if card.supersedes?.length || card.superseded_by}
+         <div class="chain-note">
+          {#if card.supersedes?.length}
+           <div>
+            <b>{t.supersedes}</b>
+            {#each card.supersedes as prev}
+             <button class="link-btn" onclick={() => jumpToCard(prev)}>{prev}</button>
+            {/each}
+           </div>
+          {/if}
+          {#if card.superseded_by}
+           <div>
+            <b>{t.supersededBy}</b>
+            <button class="link-btn" onclick={() => jumpToCard(card.superseded_by)}>
+             {card.superseded_by}
+            </button>
+           </div>
+          {/if}
+         </div>
+        {/if}
+
+        <div class="source-note">
+         <div><Quote size={16} /><b>{card.quote ? t.sourceQuote : t.cardLocation}</b></div>
+         {#if card.quote}<p>{card.quote}</p>{/if}
+         <small>{card.source} · ID: {card.id}</small>
+        </div>
+       {:else}
+        <div class="empty">
+         <Search size={26} />
+         <h3>{ready ? t.emptyLibraryTitle : t.emptyLibraryLoading}</h3>
+         {#if search || scopeFilter || !includeHistory}
+          <button
+           class="outline"
+           onclick={() => {
+            search = '';
+            scopeFilter = '';
+            includeHistory = true;
+           }}
+          >
+           {t.resetFilters}
+          </button>
+         {/if}
+        </div>
+       {/if}
+      </div>
+
       {#if card}
-       <div class="doc-meta">
-        <span class="type"><FileText size={14} />{kindText(card.kind)}</span>
-        <span>{scopeText(card.scope, card.scope_label)}</span>
-        <span class="pill status-{card.status}">{statusText(card.status)}</span>
-       </div>
-       <h2>{card.title}</h2>
-       <div class="properties">
-        <span>
-         <CalendarDays size={15} />
-         {t.effectiveRange(card.effective_from, card.effective_until)}
-        </span>
-        <span><GitCommitHorizontal size={15} />{card.version}</span>
-       </div>
-
-       {#if card.use_when?.length}
-        <div class="tags-row">
-         <Tag size={14} />
-         {#each card.use_when as kw}
-          <span class="tag-chip">{kw}</span>
-         {/each}
-        </div>
-       {/if}
-
-       <div class="prose">
-        {#each sections as s}
-         {#if s.startsWith('#')}
-          <h3>{cleanText(s.replace(/^#+\s*/, ''))}</h3>
-         {:else}
-          <p>{cleanText(s)}</p>
-         {/if}
-        {/each}
-       </div>
-
-       {#if card.supersedes?.length || card.superseded_by}
-        <div class="chain-note">
-         {#if card.supersedes?.length}
-          <div>
-           <b>{t.supersedes}</b>
-           {#each card.supersedes as prev}
-            <button class="link-btn" onclick={() => jumpToCard(prev)}>{prev}</button>
-           {/each}
-          </div>
-         {/if}
-         {#if card.superseded_by}
-          <div>
-           <b>{t.supersededBy}</b>
-           <button class="link-btn" onclick={() => jumpToCard(card.superseded_by)}>
-            {card.superseded_by}
-           </button>
-          </div>
-         {/if}
-        </div>
-       {/if}
-
-       <div class="source-note">
-        <div><Quote size={16} /><b>{card.quote ? t.sourceQuote : t.cardLocation}</b></div>
-        {#if card.quote}<p>{card.quote}</p>{/if}
-        <small>{card.source} · ID: {card.id}</small>
-       </div>
-
-       <div class="actions">
+       <div class="reading-footer">
         <button class="primary" disabled={!!busy} onclick={() => openModal('revise')}>
          <Pencil size={15} />{t.revise}
         </button>
@@ -707,33 +755,30 @@
          <FolderOpen size={15} />{t.revealFile}
         </button>
        </div>
-      {:else}
-       <div class="empty">
-        <Search size={26} />
-        <h3>{ready ? t.emptyLibraryTitle : t.emptyLibraryLoading}</h3>
-        {#if search || scopeFilter || !includeHistory}
-         <button
-          class="outline"
-          onclick={() => {
-           search = '';
-           scopeFilter = '';
-           includeHistory = true;
-          }}
-         >
-          {t.resetFilters}
-         </button>
-        {/if}
-       </div>
       {/if}
      </article>
     </div>
 
    {:else if page === 'review'}
     <div class="toolbar review-tools">
-     <div class="queue-hint">{t.queueHint(proposals.length)}</div>
-     <button class="primary" disabled={!chosen.length || !!busy} onclick={() => openModal('publish')}>
-      <CheckCheck size={16} />{t.publishBtn(chosen.length)}
-     </button>
+     <label class="search">
+      <Search size={17} />
+      <input
+       aria-label={t.reviewSearchPlaceholder}
+       placeholder={t.reviewSearchPlaceholder}
+       bind:value={reviewSearch}
+      />
+     </label>
+     <div class="review-actions-top">
+      <span class="queue-hint">{t.reviewCount(proposals.length, data.proposals.length)}</span>
+      <button
+       class="primary"
+       disabled={!chosen.length || !!busy}
+       onclick={() => openModal('publish', { items: chosen })}
+      >
+       <CheckCheck size={16} />{t.batchPublishBtn(chosen.length)}
+      </button>
+     </div>
     </div>
 
     <div class="workspace" class:detailOpen={mobileDetail}>
@@ -745,103 +790,135 @@
          aria-label={t.pendingList}
          disabled={!proposals.length}
          checked={proposals.length > 0 && proposals.every((p) => selected.includes(p.id))}
-         onchange={(e) =>
-          (selected = e.currentTarget.checked ? proposals.map((p) => p.id) : [])}
+         onchange={(e) => {
+          const visibleIds = proposals.map((p) => p.id);
+          selected = e.currentTarget.checked
+           ? [...new Set([...selected, ...visibleIds])]
+           : selected.filter((id) => !visibleIds.includes(id));
+         }}
         />
         {t.pendingList}
        </label>
        <span>{proposals.length}</span>
       </div>
-      {#each proposals as p}
-       <div class="check-row" class:current={proposal?.id === p.id}>
-        <input
-         aria-label={'Select ' + p.title}
-         type="checkbox"
-         checked={selected.includes(p.id)}
-         onchange={() => toggle(p.id)}
-        />
-        <button
-         class="entry"
-         onclick={() => {
-          proposalId = p.id;
-          mobileDetail = true;
-         }}
-        >
-         <span class="entry-meta">{scopeText(p.scope, p.scope_label)} · {p.client || 'Manual'}</span>
-         <b>{p.title}</b>
-         <small>
-          {statusText(p.state)} · {p.effective_from}
-          {#if p.target}<i></i>{t.revisionTag}{/if}
-          {#if p.opinion}<i></i>{t.checkedTag}{/if}
-         </small>
-        </button>
-       </div>
-      {:else}
-       <p class="inline-empty">{t.noPendingInline}</p>
-      {/each}
+      <div class="index-list">
+       {#each proposals as p}
+        <div class="check-row" class:current={proposal?.id === p.id}>
+         <input
+          aria-label={'Select ' + p.title}
+          type="checkbox"
+          checked={selected.includes(p.id)}
+          onchange={() => toggle(p.id)}
+         />
+         <button
+          class="entry"
+          onclick={() => {
+           proposalId = p.id;
+           mobileDetail = true;
+          }}
+         >
+          <span class="entry-meta">{scopeText(p.scope, p.scope_label)} · {p.client || 'Manual'}</span>
+          <b>{p.title}</b>
+          <small>
+           {statusText(p.state)} · {p.effective_from}
+           {#if p.target}<i></i>{t.revisionTag}{/if}
+           {#if p.opinion}<i></i>{t.checkedTag}{/if}
+          </small>
+         </button>
+        </div>
+       {:else}
+        <p class="inline-empty">
+         {data.proposals.length ? t.noMatchingDraftsInline : t.noPendingInline}
+        </p>
+       {/each}
+      </div>
      </div>
 
      <article class="reading">
-      <button class="back" onclick={() => (mobileDetail = false)}>
-       <ArrowLeft size={16} />{t.backToList}
-      </button>
-      {#if proposal}
-       <div class="doc-meta">
-        <span class="type">{statusText(proposal.state)}</span>
-        <span>{scopeText(proposal.scope, proposal.scope_label)}</span>
-        <span>{t.effectiveDate} {proposal.effective_from}</span>
-       </div>
-       <h2>{proposal.title}</h2>
-       <div class="review-section">
-        <h3>{t.beforeHeading}</h3>
-        <p>{proposal.before || t.beforeEmpty}</p>
-       </div>
-       <div class="review-section after">
-        <h3>{t.afterHeading}</h3>
-        <p>{proposal.body}</p>
-       </div>
-       <div class="review-section">
-        <h3>{t.scopeTriggersHeading}</h3>
-        <p>
-         {scopeText(proposal.scope, proposal.scope_label)} ({proposal.scope}) ·
-         {proposal.target ? t.supersedesTag(proposal.target) : t.newEntryTag}
-        </p>
-        {#if proposal.use_when?.length}
-         <div class="tags-row">
-          {#each proposal.use_when as kw}
-           <span class="tag-chip">{kw}</span>
-          {/each}
+      <div class="reading-scroll" bind:this={reviewScroll}>
+       <button class="back" onclick={() => (mobileDetail = false)}>
+        <ArrowLeft size={16} />{t.backToList}
+       </button>
+       {#if proposal}
+        <div class="doc-meta">
+         <span class="type">{statusText(proposal.state)}</span>
+         <span>{scopeText(proposal.scope, proposal.scope_label)}</span>
+         <span>{t.effectiveDate} {proposal.effective_from}</span>
+         <span class="pill">{proposal.target ? t.revisionPill(proposal.target) : t.newEntryTag}</span>
+        </div>
+        <h2>{proposal.title}</h2>
+
+        {#if proposal.target || proposal.before}
+         <div class="review-section">
+          <h3>{t.beforeCardHeading(proposal.target)}</h3>
+          <div class="md-body">{@html renderMarkdown(proposal.before || t.beforeBodyEmpty)}</div>
          </div>
         {/if}
-       </div>
-       <div class="review-section">
-        <h3>{t.aiCheckHeading}</h3>
-        <p>{proposal.opinion || t.aiCheckEmpty}</p>
-        {#if proposal.reviewer}<small>{t.aiReviewer(proposal.reviewer)}</small>{/if}
-       </div>
-       <div class="source-note">
-        <div><Quote size={15} /><b>{t.sourceNoteHeading}</b></div>
-        <p>{proposal.quote || t.noQuote}</p>
-        <small>{t.submittedMeta(proposal.client, proposal.date)}</small>
-       </div>
-       <div class="actions">
-        <button class="outline" disabled={!!busy} onclick={() => openModal('review')}>
-         <Sparkles size={15} />{t.aiCheckBtn}
+
+        <div class="review-section after">
+         <h3>{proposal.target ? t.afterHeading : t.afterBodyOnly}</h3>
+         <div class="md-body">{@html renderMarkdown(proposal.body)}</div>
+        </div>
+
+        {#if proposal.use_when?.length}
+         <div class="review-section">
+          <h3>{t.triggersHeading}</h3>
+          <div class="tags-row">
+           {#each proposal.use_when as kw}
+            <span class="tag-chip">{kw}</span>
+           {/each}
+          </div>
+         </div>
+        {/if}
+
+        <div class="review-section">
+         <h3>{t.aiCheckHeading}</h3>
+         {#if proposal.opinion}
+          <div class="md-body">{@html renderMarkdown(proposal.opinion)}</div>
+         {:else}
+          <p class="inline-empty" style="padding:4px 0 0">{t.aiCheckEmpty}</p>
+         {/if}
+         {#if proposal.reviewer}<small>{t.aiReviewer(proposal.reviewer)}</small>{/if}
+        </div>
+
+        <div class="source-note">
+         <div><Quote size={15} /><b>{t.sourceNoteHeading}</b></div>
+         <p>{proposal.quote || t.noQuote}</p>
+         <small>{t.submittedMeta(proposal.client, proposal.date)}</small>
+        </div>
+       {:else}
+        <div class="empty">
+         <GitPullRequest size={28} />
+         <h3>{data.proposals.length ? t.noMatchingDraftsTitle : t.noPendingTitle}</h3>
+         <p>{data.proposals.length ? t.noMatchingDraftsDesc : t.noPendingDesc}</p>
+         {#if data.proposals.length}
+          <button class="outline" onclick={() => (reviewSearch = '')}>{t.clearFilterBtn}</button>
+         {:else}
+          <button class="primary" onclick={() => openModal('create')}>
+           <Plus size={16} />{t.createDraftBtn}
+          </button>
+         {/if}
+        </div>
+       {/if}
+      </div>
+
+      {#if proposal}
+       <div class="reading-footer">
+        <button
+         class="primary"
+         disabled={!!busy}
+         onclick={() => openModal('publish', { items: [proposal] })}
+        >
+         <Check size={15} />{t.publishSingleBtn}
         </button>
         <button class="outline" disabled={!!busy} onclick={() => openModal('edit')}>
          <Pencil size={15} />{t.editBtn}
         </button>
+        <button class="outline" disabled={!!busy} onclick={() => openModal('review')}>
+         <Sparkles size={15} />{t.aiCheckBtn}
+        </button>
         <button class="subtle" disabled={!!busy} onclick={() => openModal('ignore')}>
          {t.ignoreBtn}
-        </button>
-       </div>
-      {:else}
-       <div class="empty">
-        <GitPullRequest size={28} />
-        <h3>{t.noPendingTitle}</h3>
-        <p>{t.noPendingDesc}</p>
-        <button class="primary" onclick={() => openModal('create')}>
-         <Plus size={16} />{t.createDraftBtn}
         </button>
        </div>
       {/if}
@@ -990,7 +1067,11 @@
 </div>
 
 {#if modal}
- <dialog bind:this={dialog} oncancel={(e) => { if (busy) e.preventDefault(); else close(); }}>
+ <dialog
+  class:wide={modal === 'proposalForm'}
+  bind:this={dialog}
+  oncancel={(e) => { if (busy) e.preventDefault(); else close(); }}
+ >
   <div class="dialog-head">
    <h2>
     {modal === 'proposalForm'
@@ -1037,7 +1118,7 @@
 
    <label>
     {t.bodyLabel}
-    <textarea rows="5" placeholder={t.bodyPlaceholder} maxlength="8000" bind:value={formBody}></textarea>
+    <textarea rows="10" placeholder={t.bodyPlaceholder} maxlength="8000" bind:value={formBody}></textarea>
    </label>
 
    <div class="form-row-2">
@@ -1089,14 +1170,14 @@
    </div>
 
   {:else if modal === 'publish'}
-   <p>{t.publishConfirmText(chosen.length)}</p>
+   <p>{t.publishConfirmText(publishTargets.length)}</p>
    <ul>
-    {#each chosen as p}
+    {#each publishTargets as p}
      <li>{p.title} ({scopeText(p.scope, p.scope_label)})</li>
     {/each}
    </ul>
    <div class="actions">
-    <button class="primary" disabled={!!busy || !chosen.length} onclick={() => execute('publish')}>
+    <button class="primary" disabled={!!busy || !publishTargets.length} onclick={() => execute('publish')}>
      {t.confirmPublish}
     </button>
     <button class="subtle" disabled={!!busy} onclick={close}>{t.cancel}</button>

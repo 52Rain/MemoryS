@@ -92,6 +92,14 @@ final class Host: NSObject, NSApplicationDelegate, WKScriptMessageHandlerWithRep
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         let url = navigationAction.request.url
+        if navigationAction.navigationType == .linkActivated,
+           let target = url,
+           let scheme = target.scheme?.lowercased(),
+           scheme == "https" || scheme == "http" {
+            NSWorkspace.shared.open(target)
+            decisionHandler(.cancel)
+            return
+        }
         let allowed = url?.isFileURL == true && url?.standardizedFileURL.path == trusted.path
         decisionHandler(allowed ? .allow : .cancel)
     }
